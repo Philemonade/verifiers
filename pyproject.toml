@@ -83,3 +83,10 @@ Homepage = "https://github.com/willccbb/verifiers"
 Documentation = "https://github.com/willccbb/verifiers"
 Repository = "https://github.com/willccbb/verifiers.git"
 Issues = "https://github.com/willccbb/verifiers/issues"
+
+[[tool.uv.index]]
+url = "https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple"
+default = true
+
+[tool.uv]
+python-install-mirror = "https://registry.npmmirror.com/-/binary/python-build-standalone/"

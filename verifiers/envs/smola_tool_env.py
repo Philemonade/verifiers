@@ -18,7 +18,9 @@ class SmolaToolEnv(MultiTurnEnv):
                  system_prompt: str = DEFAULT_TOOL_PROMPT_TEMPLATE,
                  few_shot: List[Dict[str, str]] = [],
                  mask_env_response: bool = True,
-                 max_steps: int = 10, **kwargs):
+                 max_steps: int = 10, 
+                 sampling_args: Dict[str, Any] = {},
+                 **kwargs):
         # Format the system prompt with tool descriptions
         tool_descriptions = self._format_tool_descriptions(tools)
         formatted_prompt = system_prompt.format(tool_descriptions=tool_descriptions)

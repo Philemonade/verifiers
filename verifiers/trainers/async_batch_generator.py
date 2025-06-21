@@ -61,7 +61,6 @@ class AsyncBatchGenerator:
         self.num_batches_ahead = num_batches_ahead
         self.max_queue_size = max_queue_size or max(num_batches_ahead * 2, 4)
         self.generation_timeout = generation_timeout
-        
         # Queues for communication
         self.request_queue = queue.Queue()
         self.result_queue = queue.Queue(maxsize=self.max_queue_size)

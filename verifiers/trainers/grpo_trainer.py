@@ -618,8 +618,8 @@ class GRPOTrainer(Trainer):
                         self.vllm_client.update_named_param(name, param.data)
  
         # Reset cache on vLLM (main process only)
-        if self.accelerator.is_main_process:
-            self.vllm_client.reset_prefix_cache()
+        # if self.accelerator.is_main_process:
+        #     self.vllm_client.reset_prefix_cache()
         
         # Ensure all processes wait for the main process to finish updating weights
         self.accelerator.wait_for_everyone()

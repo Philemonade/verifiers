@@ -163,7 +163,7 @@ class GRPOConfig(TrainingArguments):
         },
     )
     async_generation_timeout: float = field(
-        default=300.0,
+        default=3000.0,
         metadata={
             "help": "Timeout in seconds for async generation. If a batch doesn't complete within this time, "
             "a TimeoutError is raised."
@@ -192,7 +192,7 @@ class GRPOConfig(TrainingArguments):
         metadata={"help": "Port of the vLLM server to connect to."},
     )
     vllm_server_timeout: float = field(
-        default=300.0,
+        default=3000.0,
         metadata={
             "help": "Total timeout duration in seconds to wait for the vLLM server to be up. If the server is not up "
             "after the timeout, a `ConnectionError` is raised."

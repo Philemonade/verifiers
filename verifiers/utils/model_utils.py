@@ -61,11 +61,16 @@ def is_liger_available() -> bool:
 
 def get_model(model_name: str, use_liger: bool = True, model_kwargs: Union[Dict[str, Any], None] = None) -> Any:
     if model_kwargs is None:
+        # model_kwargs = dict(
+        #     torch_dtype=torch.bfloat16,
+        #     attn_implementation="flash_attention_2",
+        #     use_cache=False,
+        # )
         model_kwargs = dict(
-            torch_dtype=torch.bfloat16,
-            attn_implementation="flash_attention_2",
+            torch_dtype=torch.float16,
+            attn_implementation="eager",
             use_cache=False,
-        )
+        )        
     if is_liger_available() and use_liger:
         print("Using Liger kernel")
         from liger_kernel.transformers import AutoLigerKernelForCausalLM # type: ignore
