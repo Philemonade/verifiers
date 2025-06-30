@@ -66,6 +66,9 @@ class MultiTurnEnv(Environment):
                 is_completed = True
             else:
                 env_msg, state = self.env_response(messages, state, **kwargs)
+                print(f"Current turn: {turn} of {self.max_turns}")
+                print(f"Env response: {env_msg}")
                 messages.append(env_msg)
+                print(f"Messages after env response: {messages}")
                 completion.append(env_msg)
         return completion, state

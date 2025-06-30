@@ -75,6 +75,10 @@ def get_model(model_name: str, use_liger: bool = True, model_kwargs: Union[Dict[
         print("Using Liger kernel")
         from liger_kernel.transformers import AutoLigerKernelForCausalLM # type: ignore
         return AutoLigerKernelForCausalLM.from_pretrained(model_name, **model_kwargs)
+    elif model_name == "Qwen/Qwen2.5-VL-7B-Instruct":
+        print("Using Qwen2.5-VL-7B-Instruct model")
+        from transformers import Qwen2_5_VLForConditionalGeneration
+        return Qwen2_5_VLForConditionalGeneration.from_pretrained(model_name, **model_kwargs)
     else:
         return AutoModelForCausalLM.from_pretrained(model_name, **model_kwargs)
     
@@ -86,7 +90,16 @@ def get_tokenizer(model_name: str) -> Any:
                             '-Instruct'. Please provide a tokenizer with the chat_template attribute.")
     return tokenizer
             
+def get_processor(model_name: str) -> Any:
+    from transformers import AutoProcessor
+    processor = AutoProcessor.from_pretrained(model_name)
+    return processor
+
 def get_model_and_tokenizer(model_name: str, use_liger: bool = True, model_kwargs: Union[Dict[str, Any], None] = None) -> Tuple[Any, Any]:
     model = get_model(model_name, use_liger, model_kwargs)
-    tokenizer = get_tokenizer(model_name)
-    return model, tokenizer
+    if model_name == "Qwen/Qwen2.5-VL-7B-Instruct":
+        processor = get_processor(model_name)
+        return model, processor
+    else:
+        tokenizer = get_tokenizer(model_name)
+        return model, tokenizer

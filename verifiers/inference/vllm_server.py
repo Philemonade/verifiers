@@ -41,8 +41,9 @@ from vllm.distributed.parallel_state import get_world_group
 from vllm.distributed.utils import StatelessProcessGroup
 from vllm.sampling_params import GuidedDecodingParams
 from vllm.utils import get_open_port
-from transformers import AutoTokenizer
-
+from transformers import AutoTokenizer, AutoProcessor
+from qwen_vl_utils import process_vision_info
+from copy import deepcopy
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__) # Ensure logger is defined
@@ -59,6 +60,7 @@ batch_processor_task: Optional[asyncio.Task] = None
 
 # Global tokenizer for pre-checks
 proxy_tokenizer = None
+proxy_processor = None
 
 # Generation tracking
 active_generation_count = 0
@@ -85,7 +87,7 @@ async def get_next_worker_connection(connections: list[AnyType]) -> tuple[int, A
 # -------- OpenAI /v1/chat/completions Pydantic Models ---------- #
 class OAChatMessage(BaseModel):
     role: str
-    content: str
+    content: str | list[dict[str, Any]]
 
 class OAChatCompletionRequest(BaseModel):
     model: str
@@ -405,6 +407,10 @@ class ScriptArguments:
         default=128,
         metadata={"help": "Number of tokens to generate per iteration in token-chunk dynamic batching."},
     )
+    limit_mm_per_prompt: dict[str, int] = field(
+        default_factory=lambda: {"image": 5, "video": 0},
+        metadata={"help": "Limits for multimodal inputs per prompt. "},
+    )
 
 # Global/module-level variables for token-chunk dynamic batching
 _SAMPLING_PARAM_NAMES: Optional[frozenset[str]] = None
@@ -412,7 +418,7 @@ _SAMPLING_PARAM_NAMES: Optional[frozenset[str]] = None
 @dataclass(frozen=True)
 class PoolSignature:
     model_name: str
-    request_type: Literal["chat", "completion"]
+    request_type: Literal["chat", "mmchat", "completion"]
     # Excludes max_tokens and stream
     sampling_params_tuple: tuple[tuple[str, AnyType], ...]
     extra_body_params_tuple: tuple[tuple[str, AnyType], ...]
@@ -423,7 +429,7 @@ class PooledRequestState:
     completion_event: asyncio.Event
     result_container: list 
     request_id: str 
-    request_type: Literal["chat", "completion"]
+    request_type: Literal["chat", "mmchat", "completion"]
     pool_signature: PoolSignature # Store the signature for quick checks
     effective_max_tokens: int
     accumulated_content: str = ""
@@ -474,7 +480,7 @@ def _get_sampling_param_names() -> frozenset[str]:
 
 def create_pool_signature(
     model_name: str,
-    request_type: Literal["chat", "completion"],
+    request_type: Literal["chat", "mmchat", "completion"],
     raw_request_params: dict[str, AnyType], # Contains all original request fields like temp, top_p, etc.
     extra_body: Optional[dict[str, AnyType]]
 ) -> PoolSignature:
@@ -535,19 +541,35 @@ def llm_worker(
     os.environ["VLLM_DP_SIZE"] = str(script_args.data_parallel_size)
     os.environ["VLLM_DP_MASTER_PORT"] = str(master_port)
 
-    llm = LLM(
-        model=script_args.model,
-        revision=script_args.revision,
-        tensor_parallel_size=script_args.tensor_parallel_size,
-        gpu_memory_utilization=script_args.gpu_memory_utilization,
-        enforce_eager=script_args.enforce_eager,
-        dtype=script_args.dtype,
-        enable_prefix_caching=script_args.enable_prefix_caching,
-        max_model_len=script_args.max_model_len,
-        max_num_seqs=script_args.max_batch_size,
-        worker_extension_cls="verifiers.inference.vllm_server.WeightSyncWorkerExtension",
-    )
-
+    if 'Qwen2.5-VL' in script_args.model:
+        logger.info(f"[WORKER {data_parallel_rank}] Initializing {script_args.model} model")
+        llm = LLM(
+            model=script_args.model,
+            revision=script_args.revision,
+            tensor_parallel_size=script_args.tensor_parallel_size,
+            gpu_memory_utilization=script_args.gpu_memory_utilization,
+            enforce_eager=script_args.enforce_eager,
+            dtype=script_args.dtype,
+            enable_prefix_caching=script_args.enable_prefix_caching,
+            max_model_len=script_args.max_model_len,
+            max_num_seqs=script_args.max_batch_size,
+            limit_mm_per_prompt=script_args.limit_mm_per_prompt,
+            worker_extension_cls="verifiers.inference.vllm_server.WeightSyncWorkerExtension",
+        )
+    else:
+        logger.info(f"[WORKER {data_parallel_rank}] Initializing {script_args.model} model")
+        llm = LLM(
+            model=script_args.model,
+            revision=script_args.revision,
+            tensor_parallel_size=script_args.tensor_parallel_size,
+            gpu_memory_utilization=script_args.gpu_memory_utilization,
+            enforce_eager=script_args.enforce_eager,
+            dtype=script_args.dtype,
+            enable_prefix_caching=script_args.enable_prefix_caching,
+            max_model_len=script_args.max_model_len,
+            max_num_seqs=script_args.max_batch_size,
+            worker_extension_cls="verifiers.inference.vllm_server.WeightSyncWorkerExtension",
+        )
     # Send ready signal to parent process
     connection.send({"status": "ready"})
 
@@ -605,6 +627,24 @@ def chunk_list(lst: list, n: int) -> list[list]:
     """
     k, r = divmod(len(lst), n)
     return [lst[i * k + min(i, r) : (i + 1) * k + min(i + 1, r)] for i in range(n)]
+
+def convert_messages(messages):
+    """
+    Convert every {"type": "image_url", "image_url": {"url": ...}}
+    to        {"type": "image",      "image":      "..."}
+    and leave everything else untouched.
+    """
+    messages = deepcopy(messages)          
+    for msg in messages:
+        content = msg.get("content")
+        if isinstance(content, list):      
+            for part in content:
+                if part.get("type") == "image_url":
+                    part["type"]  = "image"
+                    part["image"] = part["image_url"]["url"]
+                    part.pop("image_url", None)
+
+    return messages
 
 async def batch_processing_loop(
     script_args: ScriptArguments, 
@@ -746,6 +786,7 @@ async def batch_processing_loop(
                     continue_chunk_states = []
                     prompts_for_vllm = []
                     is_chat_pool = active_pool_signature.request_type == "chat"
+                    is_mm_chat_pool = active_pool_signature.request_type == "mmchat"
 
                     for req_state in sub_batch_to_process:
                         if is_chat_pool:
@@ -756,6 +797,34 @@ async def batch_processing_loop(
                             # For continuing generation, we need to ensure there's an assistant message to continue
                             if req_state.generated_token_count == 0:
                                 # First chunk - ensure we have a valid message sequence ending with user
+                                if not current_messages:
+                                    logger_instance.error(f"Request {req_state.request_id} has no messages")
+                                    req_state.error = ValueError("No messages provided")
+                                    continue
+                                if current_messages[-1]["role"] != "user":
+                                    logger_instance.error(f"Request {req_state.request_id} last message is not from user for first chunk")
+                                    req_state.error = ValueError("Last message must be from user for first chunk")
+                                    continue
+                                first_chunk_inputs.append(current_messages)
+                                first_chunk_states.append(req_state)
+                            else:
+                                # Continuing chunk - add accumulated content as assistant message
+                                if req_state.accumulated_content:
+                                    current_messages.append({"role": "assistant", "content": req_state.accumulated_content})
+                                else:
+                                    # This should not happen - we should have content if we're continuing
+                                    logger_instance.error(f"Request {req_state.request_id} has no accumulated content for continuation")
+                                    req_state.error = ValueError("No content to continue")
+                                    continue
+                                continue_chunk_states.append(req_state)
+                        elif is_mm_chat_pool:
+                            # For multimodal chat, we need to handle both text and media inputs
+                            current_messages = []
+                            if req_state.original_chat_messages:
+                                current_messages.extend([m.model_dump() for m in req_state.original_chat_messages])
+                            
+                            # For first chunk, we need to ensure there's a user message
+                            if req_state.generated_token_count == 0:
                                 if not current_messages:
                                     logger_instance.error(f"Request {req_state.request_id} has no messages")
                                     req_state.error = ValueError("No messages provided")
@@ -985,6 +1054,255 @@ async def batch_processing_loop(
                             logger_instance.debug("No chat requests to process in this iteration")
                             processed_states = []
                             llm_results = []
+                    elif is_mm_chat_pool:
+                        loop = asyncio.get_running_loop()
+                        if first_chunk_inputs:
+                            # Filter out any already-completed requests from first_chunk_states
+                            active_first_states = []
+                            active_first_inputs = []
+                            active_first_inputs_mm = []
+                            for i, req_state in enumerate(first_chunk_states):
+                                if req_state.is_complete:
+                                    logger_instance.debug(f"Skipping already-completed request {req_state.request_id} in first chunk processing")
+                                    continue
+                                active_first_states.append(req_state)
+                                active_first_inputs.append(first_chunk_inputs[i])
+                            
+                            if not active_first_states:
+                                logger_instance.debug("All first chunk requests are already completed, skipping LLM call")
+                                processed_states = []
+                                llm_results = []
+                            else:
+                                # Pre-check token lengths before sending to vLLM
+                                length_filtered_states = []
+                                length_filtered_inputs = []
+                                
+                                if proxy_processor is not None:
+                                    # First, apply chat templates to all messages
+                                    prompts_to_tokenize = []
+                                    for messages in active_first_inputs:
+                                        messages = convert_messages(messages)
+                                        prompt = proxy_processor.apply_chat_template(
+                                            messages,
+                                            tokenize=False,
+                                            add_generation_prompt=True
+                                        )
+                                        active_first_inputs_mm.append(messages)
+                                        prompts_to_tokenize.append(prompt)
+                                    
+                                    # Batch tokenize all prompts at once
+                                    image_inputs, video_inputs, video_kwargs = process_vision_info(active_first_inputs_mm, return_video_kwargs=True)
+                                    tokenized = proxy_processor(
+                                        text=prompts_to_tokenize, 
+                                        images=image_inputs,
+                                        videos=video_inputs,
+                                        return_tensors=None, 
+                                        add_special_tokens=False)
+                                    token_counts = [len(tokens) for tokens in tokenized['input_ids']]
+                                    
+                                    # Check lengths and filter
+                                    for i, (req_state, messages, token_count) in enumerate(zip(active_first_states, active_first_inputs_mm, token_counts)):
+                                        # Check if prompt would exceed model's max length after leaving room for generation
+                                        max_prompt_tokens = script_args.max_model_len - chunk_size
+                                        if token_count > max_prompt_tokens:
+                                            logger_instance.info(f"Request {req_state.request_id} prompt too long: {token_count} tokens > {max_prompt_tokens} max. Marking as complete.")
+                                            req_state.finish_reason = "length"
+                                            req_state.error = ValueError(f"Prompt exceeds maximum length: {token_count} tokens > {script_args.max_model_len - chunk_size} allowed")
+                                        else:
+                                            length_filtered_states.append(req_state)
+                                            length_filtered_inputs.append(messages)
+                                    
+                                    # Update to use filtered lists
+                                    active_first_states = length_filtered_states
+                                    active_first_inputs_mm = length_filtered_inputs
+                                else:
+                                    # No tokenizer available, skip pre-check
+                                    logger_instance.debug("Proxy processor not available, skipping length pre-check")
+                            
+                                if not active_first_states:
+                                    logger_instance.debug("All first chunk requests exceeded length limit, skipping LLM call")
+                                    processed_states = []
+                                    llm_results = []   
+                                else:
+                                    llm_batch_inputs = []
+                                    for messages in active_first_inputs_mm:
+                                        prompt = proxy_processor.apply_chat_template(
+                                            messages,
+                                            tokenize=False,
+                                            add_generation_prompt=True
+                                        )
+                                        image_inputs, video_inputs, video_kwargs = process_vision_info(messages, return_video_kwargs=True)
+                                        mm_data = {}
+                                        if image_inputs is not None:
+                                            mm_data["image"] = image_inputs
+                                        if video_inputs is not None:
+                                            mm_data["video"] = video_inputs
+                                        llm_inputs = {
+                                            "prompt": prompt,
+                                            "multi_modal_data": mm_data,
+                                            "mm_processor_kwargs": video_kwargs,
+                                        }
+                                        llm_batch_inputs.append(llm_inputs)
+                                    payload = {
+                                        "type": "call",
+                                        "method": "generate",
+                                        "kwargs": {
+                                            "prompts": llm_batch_inputs,
+                                            "sampling_params": vllm_sampling_params,
+                                        },
+                                    }
+                                    logger_instance.debug(f"Sending first-chunk mmchat request to LLM with {len(active_first_inputs_mm)} messages")
+                                    worker_idx = -1 # Initialize to avoid unbound variable
+                                    try:
+                                        worker_idx, worker_conn = await get_next_worker_connection(connections)
+                                        logger_instance.debug(f"Using worker {worker_idx} for first-chunk mmchat request")
+                                        llm_results = await async_send_and_recv(worker_conn, payload, timeout=60.0)
+                                        logger_instance.debug(f"Received {len(llm_results)} results from LLM for first-chunk mmchat")
+                                    except asyncio.TimeoutError:
+                                        logger_instance.error(f"Worker {worker_idx} timeout for first-chunk mmchat after 60s")
+                                        for req_state in active_first_states:
+                                            req_state.error = TimeoutError("Worker timeout during generation")
+                                        llm_results = []
+                                    except Exception as e:
+                                        logger_instance.error(f"Error calling LLM for first-chunk mmchat: {e}", exc_info=True)
+                                        for req_state in active_first_states:
+                                            req_state.error = e 
+                                        llm_results = []
+                                    processed_states = active_first_states
+                        elif continue_chunk_states:
+                            # No first-chunk requests, process continuing requests
+                            continue_chunk_inputs = []
+                            continue_chunk_inputs_mm = []
+                            # Filter out any already-completed requests
+                            active_continue_states = []
+                            for req_state in continue_chunk_states:
+                                if req_state.is_complete:
+                                    logger_instance.debug(f"Skipping already-completed request {req_state.request_id} in continue chunk processing")
+                                    continue
+                                active_continue_states.append(req_state)
+                                current_messages = []
+                                if req_state.original_chat_messages:
+                                    current_messages.extend([m.model_dump() for m in req_state.original_chat_messages])
+                                
+                                # Must have accumulated content to continue
+                                if not req_state.accumulated_content:
+                                    logger_instance.error(f"Request {req_state.request_id} has no accumulated content for continuation")
+                                    req_state.error = ValueError("No content to continue generation")
+                                    active_continue_states.remove(req_state)
+                                    continue
+
+                                # Add the accumulated content as the assistant message to continue
+                                current_messages.append({"role": "assistant", "content": req_state.accumulated_content})
+                                continue_chunk_inputs.append(current_messages)
+
+                            if not active_continue_states:
+                                logger_instance.debug("All continue chunk requests are already completed, skipping LLM call")
+                                processed_states = []
+                                llm_results = []
+                            else:
+                                # Pre-check token lengths before sending to vLLM
+                                if proxy_processor is not None:
+                                    length_filtered_states = []
+                                    length_filtered_inputs = []
+                                    
+                                    # First, apply chat templates to all messages
+                                    prompts_to_tokenize = []
+                                    for messages in continue_chunk_inputs:
+                                        messages = convert_messages(messages)
+                                        prompt = proxy_processor.apply_chat_template(
+                                            messages,
+                                            tokenize=False,
+                                            add_generation_prompt=False,
+                                            continue_final_message=True
+                                        )
+                                        continue_chunk_inputs_mm.append(messages)
+                                        prompts_to_tokenize.append(prompt)
+                                    
+                                    # Batch tokenize all prompts at once
+                                    image_inputs, video_inputs, video_kwargs = process_vision_info(continue_chunk_inputs_mm, return_video_kwargs=True)
+                                    tokenized = proxy_processor(
+                                        text=prompts_to_tokenize, 
+                                        images=image_inputs,
+                                        videos=video_inputs,
+                                        return_tensors=None, 
+                                        add_special_tokens=False)
+                                    token_counts = [len(tokens) for tokens in tokenized['input_ids']]
+                                    
+                                    # Check lengths and filter
+                                    for i, (req_state, messages, token_count) in enumerate(zip(active_continue_states, continue_chunk_inputs_mm, token_counts)):
+                                        # Check if prompt would exceed model's max length after leaving room for generation
+                                        max_prompt_tokens = script_args.max_model_len - chunk_size
+                                        if token_count > max_prompt_tokens:
+                                            logger_instance.info(f"Request {req_state.request_id} continuation prompt too long: {token_count} tokens > {max_prompt_tokens} max. Marking as complete.")
+                                            req_state.finish_reason = "length"
+                                            req_state.error = ValueError(f"Continuation prompt exceeds maximum length: {token_count} tokens > {script_args.max_model_len - chunk_size} allowed")
+                                        else:
+                                            length_filtered_states.append(req_state)
+                                            length_filtered_inputs.append(messages)
+                                    
+                                    # Update to use filtered lists
+                                    active_continue_states = length_filtered_states
+                                    continue_chunk_inputs = length_filtered_inputs
+                                else:
+                                    logger_instance.debug("Proxy processor not available, skipping length pre-check for continuations")
+                                
+                                if not active_continue_states:
+                                    logger_instance.debug("All continue chunk requests exceeded length limit, skipping LLM call")
+                                    processed_states = []
+                                    llm_results = []
+                                else:
+                                    llm_batch_inputs = []
+                                    for messages in continue_chunk_inputs:
+                                        prompt = proxy_processor.apply_chat_template(
+                                            messages,
+                                            tokenize=False,
+                                            add_generation_prompt=False,
+                                            continue_final_message=True
+                                        )
+                                        image_inputs, video_inputs, video_kwargs = process_vision_info(messages, return_video_kwargs=True)
+                                        mm_data = {}
+                                        if image_inputs is not None:
+                                            mm_data["image"] = image_inputs
+                                        if video_inputs is not None:
+                                            mm_data["video"] = video_inputs
+                                        llm_inputs = {
+                                            "prompt": prompt,
+                                            "multi_modal_data": mm_data,
+                                            "mm_processor_kwargs": video_kwargs,
+                                        }
+                                        llm_batch_inputs.append(llm_inputs)
+                                    payload = {
+                                        "type": "call",
+                                        "method": "generate",
+                                        "kwargs": {
+                                            "prompts": llm_batch_inputs,
+                                            "sampling_params": vllm_sampling_params,
+                                        },
+                                    }
+                                    logger_instance.debug(f"Sending continue-chunk mmchat request to LLM with {len(llm_batch_inputs)} messages")
+                                    worker_idx = -1
+                                    try:
+                                        worker_idx, worker_conn = await get_next_worker_connection(connections)
+                                        logger_instance.debug(f"Using worker {worker_idx} for continue-chunk mmchat request")
+                                        llm_results = await async_send_and_recv(worker_conn, payload, timeout=60.0)
+                                        logger_instance.debug(f"Received {len(llm_results)} results from LLM for continue-chunk mmchat")
+                                    except asyncio.TimeoutError:
+                                        logger_instance.error(f"Worker {worker_idx} timeout for continue-chunk mmchat after 60s")
+                                        for req_state in active_continue_states:
+                                            req_state.error = TimeoutError("Worker timeout during generation")
+                                        llm_results = []
+                                    except Exception as e:
+                                        logger_instance.error(f"Error calling LLM for continue-chunk mmchat: {e}", exc_info=True)
+                                        for req_state in active_continue_states:
+                                            req_state.error = e
+                                        llm_results = []
+                                    processed_states = active_continue_states
+                        
+                        else:
+                            # No requests to process in this iteration
+                            logger_instance.debug("No mmchat requests to process in this iteration")
+                            processed_states = []
+                            llm_results = []
                     else:
                         # completion – unchanged
                         loop = asyncio.get_running_loop()
@@ -1108,6 +1426,68 @@ async def batch_processing_loop(
                                 
                                 # Log current state
                                 logger_instance.debug(f"Request {req_state.request_id} chunk processed. Tokens in chunk: {new_token_count}, total: {req_state.generated_token_count}, is_complete: {req_state.is_complete}")
+                    elif is_mm_chat_pool:
+                        if processed_states and (len(llm_results) != len(processed_states)):
+                            logger_instance.error(f"LLM result count mismatch. Expected {len(processed_states)}, got {len(llm_results)} for sig {active_pool_signature}. Marking affected requests in sub-batch as error.")
+                            for req_state in processed_states:
+                                if not req_state.completed_and_signaled:
+                                    req_state.error = RuntimeError("LLM result mismatch in batch processing.")
+                                    req_state.finish_reason = "error"
+                                    temp_failed_requests_in_sub_batch.append(req_state)
+                        else:
+                            real_idx = 0
+                            for req_state in processed_states:
+                                if req_state.completed_and_signaled:
+                                    continue
+                                request_output = llm_results[real_idx]
+                                real_idx += 1
+                                if not request_output.outputs or len(request_output.outputs) == 0:
+                                    logger_instance.warning(f"Request {req_state.request_id} (idx {real_idx-1}) received no output from vLLM in chunk.")
+                                    # This might happen if vLLM can't generate any tokens (e.g., due to constraints)
+                                    # Mark as complete rather than error
+                                    req_state.finish_reason = "stop"  # vLLM couldn't generate
+                                    logger_instance.info(f"Request {req_state.request_id} marked complete due to empty vLLM output")
+                                    continue
+                                completion_output = request_output.outputs[0]
+                                new_text_chunk = completion_output.text
+                                req_state.accumulated_content += new_text_chunk
+                                new_token_count = len(completion_output.token_ids)
+                                req_state.generated_token_count += new_token_count
+
+                                # Store vLLM's finish reason but we'll interpret it carefully
+                                vllm_finish_reason = completion_output.finish_reason
+                                logged_finish_reason = vllm_finish_reason if vllm_finish_reason else "unknown"
+
+                                if vllm_finish_reason == "length":
+                                    # vLLM hit the chunk limit - only set our finish_reason if we're at our actual limit
+                                    if req_state.generated_token_count >= req_state.effective_max_tokens:
+                                        req_state.finish_reason = "length"
+                                        logger_instance.debug(f"[FINISH_REASON] Request {req_state.request_id}: Setting finish_reason='length' - hit actual limit")
+                                    else:
+                                        # Don't set finish_reason - we can continue generating
+                                        logger_instance.debug(f"[FINISH_REASON] Request {req_state.request_id}: Ignoring vLLM's finish_reason='length' - only at chunk limit")
+                                elif vllm_finish_reason is not None:
+                                    # Other finish reasons (stop, eos_token, etc.) are real completions
+                                    req_state.finish_reason = vllm_finish_reason
+                                    logger_instance.debug(f"[FINISH_REASON] Request {req_state.request_id}: Setting finish_reason='{logged_finish_reason}' from vLLM")
+                                
+                                # Log detailed state for debugging
+                                logger_instance.debug(f"Request {req_state.request_id} chunk result: "
+                                                    f"new_tokens={new_token_count}, total_tokens={req_state.generated_token_count}, "
+                                                    f"finish_reason={req_state.finish_reason}, chunk_text_len={len(new_text_chunk)}")
+
+                                if new_token_count < chunk_size:
+                                    # Incomplete chunk indicates generation should stop
+                                    logger_instance.info(f"Request {req_state.request_id} generated incomplete chunk. "
+                                                        f"Generated {new_token_count}/{chunk_size} tokens in chunk. "
+                                                        f"Marking as complete to prevent doom loop.")
+                                    # Set finish reason if not already set by vLLM
+                                    if req_state.finish_reason is None:
+                                        req_state.finish_reason = "stop"
+                                        logger_instance.debug(f"[FINISH_REASON] Request {req_state.request_id}: Setting finish_reason='stop' due to incomplete chunk")
+                                
+                                # Log current state
+                                logger_instance.debug(f"Request {req_state.request_id} chunk processed. Tokens in chunk: {new_token_count}, total: {req_state.generated_token_count}, is_complete: {req_state.is_complete}")
                     else:
                         # completion – unchanged
                         if len(llm_results) != len(processed_states):
@@ -1218,7 +1598,7 @@ async def batch_processing_loop(
                         if req_state.error:
                             logger_instance.error(f"Request {req_state.request_id} failed with error: {req_state.error}")
                             # Return a successful response with error content instead of HTTP error
-                            if req_state.request_type == "chat":
+                            if req_state.request_type in ("chat", "mmchat"):
                                 error_message = f"[ERROR] {str(req_state.error)}"
                                 final_choices = [OAChatChoice(
                                     index=0,
@@ -1244,7 +1624,7 @@ async def batch_processing_loop(
                                     model=req_state.original_request.model,
                                     choices=final_choices
                                 )
-                        elif req_state.request_type == "chat":
+                        elif req_state.request_type in ("chat", "mmchat"):
                             final_choices = [OAChatChoice(
                                 index=0,
                                 message=OAChatMessage(role="assistant", content=req_state.accumulated_content),
@@ -1316,13 +1696,20 @@ async def batch_processing_loop(
 def main(script_args: ScriptArguments):
     global request_queue, batch_processor_task # Allow lifespan to assign to these
     global proxy_tokenizer # Add this global
+    global proxy_processor # Add this global for VL models
 
-    # Initialize proxy tokenizer for pre-checks
-    proxy_tokenizer = AutoTokenizer.from_pretrained(
-        script_args.model,
-        revision=script_args.revision,
-        trust_remote_code=True
-    )
+    # Initialize proxy tokenizer/processor for pre-checks
+    if 'Qwen2.5-VL' in script_args.model:
+        logger.info(f"Main: Using processor to tokenize for {script_args.model}.")
+        proxy_processor = AutoProcessor.from_pretrained(
+            script_args.model
+        )
+    else:
+        proxy_tokenizer = AutoTokenizer.from_pretrained(
+            script_args.model,
+            revision=script_args.revision,
+            trust_remote_code=True
+        )
 
     # Spawn dp workers, and setup pipes for communication
     master_port = get_open_port()
@@ -1444,6 +1831,8 @@ def main(script_args: ScriptArguments):
         request_id = f"chatcmpl-{uuid4().hex}"
         logger.debug(f"Received chat request {request_id}, model: {req.model}")
 
+        multi_modal = any(isinstance(m.content, list) for m in req.messages)
+
         # Create signature for pooling
         # The OAChatCompletionRequest fields are: model, messages, temperature, top_p, max_tokens, stream, extra_body
         # We need to pass the relevant ones to create_pool_signature
@@ -1462,9 +1851,11 @@ def main(script_args: ScriptArguments):
         default_max = OAChatCompletionRequest.model_fields["max_tokens"].default
         effective_max_tokens = req.max_tokens or default_max
 
+        req_type = "mmchat" if multi_modal else "chat"
+
         pool_sig = create_pool_signature(
             model_name=req.model,
-            request_type="chat",
+            request_type=req_type,
             raw_request_params=raw_params_for_sig,
             extra_body=req.extra_body
         )
@@ -1477,7 +1868,7 @@ def main(script_args: ScriptArguments):
             completion_event=completion_event,
             result_container=result_container,
             request_id=request_id,
-            request_type="chat",
+            request_type=req_type,
             pool_signature=pool_sig,
             effective_max_tokens=effective_max_tokens,
             original_chat_messages=req.messages, # Store original messages
@@ -1882,8 +2273,23 @@ def make_parser():
                         help="Timeout in seconds for a single request waiting for its turn and completion.")
     parser.add_argument("--token-chunk-size", type=int, default=64,
                         help="Number of tokens to generate per iteration per request in token-chunk dynamic batching.")
+    parser.add_argument("--limit-mm-per-prompt", type=str, default="image=5,video=0",
+                        help="Visual quota per prompt (vLLM arg). ")
     
     return parser
+
+def _parse_mm_limit(spec: str) -> dict[str, int]:
+    """
+    Turn 'image=5,video=0' into {'image': 5, 'video': 0}.
+    Accepts missing parts; ignores blanks.
+    """
+    out: dict[str, int] = {}
+    for part in (p.strip() for p in spec.split(",") if p.strip()):
+        if "=" not in part:
+            raise ValueError(f"--limit-mm-per-prompt expects k=v pairs, got '{part}'")
+        k, v = part.split("=", 1)
+        out[k.strip()] = int(v)
+    return out
 
 def cli_main():
     """Entry point for the vf-vllm CLI command."""
@@ -1907,7 +2313,8 @@ def cli_main():
         log_level=args.log_level,
         max_batch_size=args.max_batch_size,
         batch_request_timeout_seconds=args.batch_request_timeout_seconds,
-        token_chunk_size=args.token_chunk_size
+        token_chunk_size=args.token_chunk_size,
+        limit_mm_per_prompt=_parse_mm_limit(args.limit_mm_per_prompt)
     )
     
     main(script_args)

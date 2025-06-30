@@ -18,7 +18,7 @@ class SmolaToolEnv(MultiTurnEnv):
                  system_prompt: str = DEFAULT_TOOL_PROMPT_TEMPLATE,
                  few_shot: List[Dict[str, str]] = [],
                  mask_env_response: bool = True,
-                 max_steps: int = 10, 
+                 max_turns: int = 10, 
                  sampling_args: Dict[str, Any] = {},
                  **kwargs):
         # Format the system prompt with tool descriptions
@@ -30,12 +30,12 @@ class SmolaToolEnv(MultiTurnEnv):
             system_prompt=formatted_prompt,
             few_shot=few_shot,
             mask_env_response=mask_env_response,
-            max_steps=max_steps,
+            max_turns=max_turns,
             sampling_args=sampling_args,
             **kwargs
         )
         self.dataset_name = dataset
-        self.max_steps = max_steps
+        self.max_turns = max_turns
         self.tools = {tool.name: tool for tool in tools}
         self.rubric = SmolaToolRubric(tools=tools)
         self.llm_parser = SmolaParser(fields=["reasoning", ("tool", "answer")])
@@ -85,7 +85,7 @@ class SmolaToolEnv(MultiTurnEnv):
         try:
             # Check if we've hit max steps by counting tool uses in the message history
             step_count = self._get_step_count(messages)
-            if step_count > self.max_steps:
+            if step_count > self.max_turns:
                 return True
             
             parsed = self.llm_parser.parse(messages[-1]["content"])

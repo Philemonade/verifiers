@@ -2,6 +2,8 @@ import inspect
 import json
 from typing import List, Dict, Any, Callable, Tuple
 
+from datasets import Dataset
+
 from verifiers import RewardFunc
 from verifiers.envs.multiturn_env import MultiTurnEnv
 from verifiers.parsers import XMLParser
@@ -79,6 +81,8 @@ def format_tool_descriptions(schemas: List[Dict[str, Any]]) -> str:
 
 class ToolEnv(MultiTurnEnv):
     def __init__(self,
+                 dataset: Dataset | None = None,
+                 eval_dataset: Dataset | None = None,
                  tools: List[Callable] = [],
                  system_prompt: str = DEFAULT_TOOL_PROMPT_TEMPLATE,
                  parser: XMLParser = XMLParser(fields=["think", ("tool", "answer")]),
@@ -93,6 +97,8 @@ class ToolEnv(MultiTurnEnv):
         tool_descriptions = format_tool_descriptions(self.tool_schemas)
         formatted_prompt = system_prompt.format(tool_descriptions=tool_descriptions)
         super().__init__(
+            dataset=dataset,
+            eval_dataset=eval_dataset,
             system_prompt=formatted_prompt,
             parser=parser,
             rubric=rubric,

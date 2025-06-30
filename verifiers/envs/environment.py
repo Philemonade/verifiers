@@ -1,5 +1,6 @@
 import asyncio
 import logging
+import json
 from asyncio import Semaphore
 from abc import ABC, abstractmethod
 from copy import deepcopy
@@ -101,11 +102,12 @@ class Environment(ABC):
         return messages
 
     def format_dataset(self,
-                       dataset: Dataset,
-                       system_prompt: str | None = None,
-                       few_shot: List[Dict[str, Any]] | None = None,
-                       question_key: str = "question",
-                       answer_key: str = "answer") -> Dataset:
+                        dataset: Dataset,
+                        system_prompt: str | None = None,
+                        few_shot: List[Dict[str, Any]] | None = None,
+                        question_key: str = "question",
+                        image_key: str = "image",
+                        answer_key: str = "answer") -> Dataset:
         # skip if "prompt" already exists
         if "prompt" in dataset.column_names:
             return dataset
@@ -117,17 +119,40 @@ class Environment(ABC):
             if few_shot:
                 messages.extend(few_shot)
             messages.append({'role': 'user', 'content': prompt})
-            return messages
-        
+            print(f"messages: {messages}")
+            return json.dumps(messages)
+
+        def format_mm_prompt_fn(prompt: str, image: str) -> List[Dict[str, Any]]:
+            messages = []
+            if system_prompt:
+                messages.append({'role': 'system', 'content': system_prompt})
+            if few_shot:
+                messages.extend(few_shot)
+            messages.append({'role': 'user', 'content': [{'type': 'image_url','image_url': {'url': image}},{'type': 'text', 'text': prompt}]})
+            print(f"messages: {messages}")
+            return json.dumps(messages)
+
+
         if answer_key == "answer":
-            return dataset.map(lambda x: {
-                "prompt": format_prompt_fn(x[question_key]),
-            }, num_proc=min(self.max_concurrent, 32))
+            if "image" in dataset.column_names:
+                return dataset.map(lambda x: {
+                    "prompt": format_mm_prompt_fn(x[question_key], x[image_key]),
+                }, num_proc=min(self.max_concurrent, 32))
+            else:
+                return dataset.map(lambda x: {
+                    "prompt": format_prompt_fn(x[question_key]),
+                }, num_proc=min(self.max_concurrent, 32))
         else:
-            return dataset.map(lambda x: {
-                "prompt": format_prompt_fn(x[question_key]),
-                "answer": x[answer_key]
-            }, num_proc=min(self.max_concurrent, 32))
+            if "image" in dataset.column_names:
+                return dataset.map(lambda x: {
+                    "prompt": format_mm_prompt_fn(x[question_key], x[image_key]),
+                    "answer": x[answer_key]
+                }, num_proc=min(self.max_concurrent, 32))                
+            else:
+                return dataset.map(lambda x: {
+                    "prompt": format_prompt_fn(x[question_key]),
+                    "answer": x[answer_key]
+                }, num_proc=min(self.max_concurrent, 32))
 
     def get_dataset(self, n: int = -1, seed: int = 0, **kwargs: Any) -> Dataset | None:
         if n > 0 and self.dataset is not None:
@@ -157,7 +182,7 @@ class Environment(ABC):
         return sampling_args
 
     def get_model_response(self,
-                           prompt: str | List[Dict[str, str]],
+                           prompt: str | List[Dict[str, Any]],
                            client: OpenAI,
                            model: str,
                            sampling_args: Dict[str, Any] = {},

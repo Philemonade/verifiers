@@ -28,7 +28,7 @@ CUDA_VISIBLE_DEVICES=0,1,2,3 python verifiers/inference/vllm_server.py \
 CUDA_VISIBLE_DEVICES=4,5,6,7 accelerate launch --config-file configs/zero3.yaml --num-processes 4 verifiers/examples/smola_math_tools.py
 """
 
-dataset = load_example_dataset("math", "train", n=6000)
+dataset = load_example_dataset("math", "train", n=4)
 
 eval_aime24 = load_example_dataset("aime2024", n=30)
 eval_aime25 = load_example_dataset("aime2025", n=30)
@@ -43,11 +43,11 @@ calculator_tool = CalculatorTool()
 
 vf_env = SmolaToolEnv(
     dataset=dataset,
-    eval_dataset=eval_dataset,
+    # eval_dataset=eval_dataset,
     system_prompt=MATH_SMOLA_PROMPT_TEMPLATE,
-    few_shot=CALCULATOR_SMOLA_FEW_SHOTS,
+    # few_shot=CALCULATOR_SMOLA_FEW_SHOTS,
     tools=[python_tool, calculator_tool],
-    max_steps=5
+    max_turns=3
 )
 print(vf_env.system_prompt)
 

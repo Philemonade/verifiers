@@ -160,6 +160,22 @@ def get_preprocess_fn(name: str) -> Callable[[Dict], Dict]:
                 "answer": x["verification_info"],
             }
         return preprocess_prime_code
+    elif name == "seal_vqa_data":
+        def preprocess_seal_vqa(x: Dict[str, Any]) -> Dict[str, Any]:
+            return {
+                "image": x["image"],
+                "question": x["question"],
+                "answer": x["answer"],
+            }
+        return preprocess_seal_vqa
+    elif name == "vstar_bench":
+        def preprocess_vstar_bench(x: Dict[str, Any]) -> Dict[str, Any]:
+            return {
+                "image": x["image"],
+                "question": x["text"],
+                "answer": x["label"],
+            }
+        return preprocess_vstar_bench
     else:
         raise ValueError(f"Dataset {name} not supported for preprocess_dataset.")
 
@@ -232,6 +248,14 @@ def load_example_dataset(name: str = "gsm8k",
             split = "train"
         dataset: Dataset = load_dataset("PrimeIntellect/verifiable-coding-problems")[split] # type: ignore
         dataset = dataset.filter(lambda x: x['prompt'].startswith("Solve the following coding problem using the programming language python:")) # type: ignore
+    elif name == "seal_vqa_data":
+        if split is None:
+            split = "train"
+        dataset: Dataset = load_dataset("craigwu/seal_vqa_data", data_files="GQA_data.json")[split] # type: ignore
+    elif name == "vstar_bench":
+        if split is None:
+            split = "train"
+        dataset: Dataset = load_dataset("craigwu/vstar_bench")[split] # type: ignore
     else:
         raise ValueError(f"Dataset {name} not supported for preprocess_dataset. \
 Please ensure that the dataset is formatted with 'prompt' (str) and 'answer' (str) keys.")
