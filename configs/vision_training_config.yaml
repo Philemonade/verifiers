@@ -1,0 +1,136 @@
+# Vision Training Configuration for Qwen2.5-VL-7B
+# This file contains different configuration presets for training
+
+# Base configuration
+base:
+  model_name: "Qwen/Qwen2.5-VL-7B-Instruct"
+  dataset_name: "nlphuji/flickr30k"
+  output_dir: "./outputs/qwen-vision-grpo"
+  
+  # Environment settings
+  max_turns: 5
+  reward_types: ["format", "tool", "answer", "image"]
+  reward_weights: [0.2, 0.3, 0.3, 0.2]
+  image_reward_types: ["self", "embedding"]
+  image_reward_weights: [0.7, 0.3]
+  
+  # Training settings
+  num_epochs: 3
+  batch_size: 2
+  gradient_accumulation_steps: 4
+  learning_rate: 1.0e-6
+  warmup_steps: 100
+  save_steps: 500
+  eval_steps: 250
+  
+  # GRPO settings
+  num_generations: 4
+  beta: 0.01
+  num_iterations: 1
+  max_grad_norm: 1.0
+  
+  # LoRA settings
+  use_lora: true
+  lora_rank: 64
+  lora_alpha: 32
+  lora_dropout: 0.1
+
+# Development/Testing preset - Fast training for development
+development:
+  <<: *base
+  num_samples: 100
+  max_turns: 3
+  num_epochs: 1
+  batch_size: 1
+  gradient_accumulation_steps: 2
+  save_steps: 50
+  eval_steps: 25
+  image_reward_types: ["embedding"]  # Fastest reward type
+  image_reward_weights: [1.0]
+
+# High-quality preset - Best results but slower
+high_quality:
+  <<: *base
+  num_samples: 5000
+  max_turns: 7
+  num_epochs: 5
+  learning_rate: 5.0e-7  # Lower learning rate
+  warmup_steps: 200
+  image_reward_types: ["self", "teacher", "attention", "embedding"]
+  image_reward_weights: [0.3, 0.3, 0.2, 0.2]
+  teacher_model_name: "Qwen/Qwen2.5-VL-72B-Instruct"
+  num_generations: 6  # Larger group size
+  lora_rank: 128  # Higher rank for better capacity
+
+# Memory-efficient preset - For limited GPU memory
+memory_efficient:
+  <<: *base
+  batch_size: 1
+  gradient_accumulation_steps: 8
+  use_lora: true
+  lora_rank: 32
+  gradient_checkpointing: true
+  bf16: true
+  max_turns: 3
+  image_reward_types: ["embedding"]
+  image_reward_weights: [1.0]
+
+# Balanced preset - Good performance/speed tradeoff
+balanced:
+  <<: *base
+  num_samples: 2000
+  max_turns: 5
+  num_epochs: 3
+  batch_size: 2
+  gradient_accumulation_steps: 4
+  image_reward_types: ["self", "embedding"]
+  image_reward_weights: [0.6, 0.4]
+  lora_rank: 64
+
+# Research preset - For experimental features
+research:
+  <<: *base
+  num_samples: 1000
+  max_turns: 8
+  num_epochs: 4
+  image_reward_types: ["self", "teacher", "attention", "embedding"]
+  image_reward_weights: [0.25, 0.25, 0.25, 0.25]
+  reward_types: ["format", "tool", "answer", "image"]
+  reward_weights: [0.1, 0.4, 0.3, 0.2]  # Higher tool reward weight
+  teacher_model_name: "Qwen/Qwen2.5-VL-72B-Instruct"
+  
+# Ablation study presets
+ablation_no_image_rewards:
+  <<: *base
+  reward_types: ["format", "tool", "answer"]
+  reward_weights: [0.3, 0.4, 0.3]
+
+ablation_only_image_rewards:
+  <<: *base
+  reward_types: ["image"]
+  reward_weights: [1.0]
+  image_reward_types: ["self", "embedding"]
+  image_reward_weights: [0.5, 0.5]
+
+ablation_no_tools:
+  <<: *base
+  max_turns: 1  # Single turn without tools
+  reward_types: ["format", "answer"]
+  reward_weights: [0.3, 0.7]
+
+# Dataset-specific presets
+coco_captions:
+  <<: *base
+  dataset_name: "HuggingFaceM4/COCO"
+  num_samples: 3000
+  
+flickr30k:
+  <<: *base
+  dataset_name: "nlphuji/flickr30k"
+  num_samples: 2000
+
+vqa:
+  <<: *base
+  dataset_name: "HuggingFaceM4/VQAv2"
+  num_samples: 5000
+  max_turns: 3  # VQA typically doesn't need many turns

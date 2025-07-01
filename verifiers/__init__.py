@@ -22,6 +22,15 @@ from .envs.singleturn_env import SingleTurnEnv
 from .envs.tool_env import ToolEnv
 from .envs.env_group import EnvGroup
 
+# Vision-language components (optional import)
+try:
+    from .envs.vision_env import VisionLanguageEnv
+    from .tools.image_tools import IMAGE_TOOLS
+    from .rubrics.vision_rewards import ImageRewardCalculator, create_image_reward_func
+    _VISION_AVAILABLE = True
+except ImportError:
+    _VISION_AVAILABLE = False
+
 from .trainers import GRPOTrainer, GRPOConfig, grpo_defaults, lora_defaults
 
 __version__ = "0.1.0"
@@ -54,3 +63,12 @@ __all__ = [
     "setup_logging",
     "print_prompt_completions_sample",
 ]
+
+# Add vision components to __all__ if available
+if _VISION_AVAILABLE:
+    __all__.extend([
+        "VisionLanguageEnv",
+        "IMAGE_TOOLS",
+        "ImageRewardCalculator",
+        "create_image_reward_func",
+    ])
